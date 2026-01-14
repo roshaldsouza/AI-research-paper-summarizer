@@ -1,236 +1,228 @@
 import requests
 import PyPDF2
-from typing import List
-import os
 import sys
 import re
 
-class PaperSummarizer:
-    def __init__(self, model_name='llama3', ollama_url='http://localhost:11434'):
-        """Initialize the RAG-based paper summarizer"""
-        self.model_name = model_name
-        self.ollama_url = ollama_url
-        print(f"✅ Summarizer ready! Using model: {model_name}")
+class PDFChatbot:
+    def __init__(self, pdf_path, model='llama3'):
+        self.model = model
+        self.pdf_path = pdf_path
+        self.chunks = []
+        self.full_text = ""
+        
+        print("\n" + "="*60)
+        print("📚 Loading your PDF...")
+        self.load_pdf()
+        print(f"✅ Loaded {len(self.full_text)} characters")
+        print(f"✅ Created {len(self.chunks)} chunks")
+        print("="*60)
     
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract text from PDF file"""
+    def load_pdf(self):
+        """Extract and chunk the PDF - memory efficient"""
+        # Extract text with limit
         text = ""
-        try:
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page in pdf_reader.pages:
-                    text += page.extract_text() + "\n"
-            return text
-        except Exception as e:
-            raise Exception(f"Error reading PDF: {str(e)}")
-    
-    def chunk_text(self, text: str, chunk_size: int = 600, overlap: int = 100) -> List[str]:
-        """Split text into overlapping chunks"""
-        chunks = []
-        start = 0
+        max_chars = 50000  # Limit to prevent memory issues
+        
+        with open(self.pdf_path, 'rb') as file:
+            pdf = PyPDF2.PdfReader(file)
+            total_pages = len(pdf.pages)
+            print(f"   PDF has {total_pages} pages")
+            
+            for i, page in enumerate(pdf.pages):
+                if len(text) > max_chars:
+                    print(f"   (Loaded first {i} pages to save memory)")
+                    break
+                text += page.extract_text() + "\n"
         
         # Clean text
         text = re.sub(r'\s+', ' ', text).strip()
+        self.full_text = text[:max_chars]  # Truncate if needed
         
-        while start < len(text):
-            end = min(start + chunk_size, len(text))
-            chunk = text[start:end]
-            
-            # Try to break at sentence boundaries
-            if end < len(text):
-                # Look for period, question mark, or exclamation
-                last_sentence = max(
-                    chunk.rfind('. '),
-                    chunk.rfind('? '),
-                    chunk.rfind('! ')
-                )
-                if last_sentence > chunk_size * 0.4:
-                    end = start + last_sentence + 2
-                    chunk = text[start:end]
-            
-            if chunk.strip():
-                chunks.append(chunk.strip())
-            start = end - overlap
+        # Create chunks
+        chunk_size = 600
+        overlap = 50
+        chunks_created = 0
         
-        return chunks
+        for start in range(0, len(self.full_text), chunk_size - overlap):
+            end = min(start + chunk_size, len(self.full_text))
+            chunk = self.full_text[start:end]
+            
+            # Break at sentence
+            if end < len(self.full_text):
+                last_period = chunk.rfind('. ')
+                if last_period > chunk_size * 0.3:
+                    chunk = chunk[:last_period + 1]
+            
+            if chunk.strip() and len(chunk) > 50:
+                self.chunks.append(chunk.strip())
+                chunks_created += 1
+                
+                # Safety limit
+                if chunks_created > 100:
+                    break
     
-    def retrieve_relevant_chunks(self, chunks: List[str], top_k: int = 4) -> List[str]:
-        """Retrieve most relevant chunks using keyword matching"""
-        # Keywords to look for in research papers
-        keywords = [
-            'abstract', 'introduction', 'method', 'approach', 'result', 
-            'finding', 'conclusion', 'contribution', 'propose', 'show',
-            'demonstrate', 'experiment', 'evaluation', 'performance',
-            'research', 'study', 'analysis', 'data', 'model'
-        ]
+    def find_relevant_chunks(self, question, top_k=3):
+        """Find chunks most relevant to the question"""
+        question_lower = question.lower()
+        question_words = set(w for w in question_lower.split() if len(w) > 3)
         
-        scored_chunks = []
-        for chunk in chunks:
+        scored = []
+        for i, chunk in enumerate(self.chunks):
             chunk_lower = chunk.lower()
-            # Count keyword matches
-            score = sum(1 for keyword in keywords if keyword in chunk_lower)
-            # Prefer chunks with more content
-            score += len(chunk) / 1000
-            scored_chunks.append((score, chunk))
+            
+            # Count matching words
+            score = 0
+            for word in question_words:
+                if word in chunk_lower:
+                    score += 1
+            
+            # Bonus for question words appearing together
+            if any(word in chunk_lower for word in question_words):
+                score += 0.5
+            
+            scored.append((score, i, chunk))
         
-        # Sort by score and take top-k
-        scored_chunks.sort(reverse=True, key=lambda x: x[0])
-        return [chunk for _, chunk in scored_chunks[:top_k]]
+        # Sort by score
+        scored.sort(reverse=True, key=lambda x: x[0])
+        
+        # Return top chunks
+        return [chunk for _, _, chunk in scored[:top_k]]
     
-    def call_ollama(self, prompt: str) -> str:
-        """Call Ollama API for text generation"""
+    def ask_ollama(self, question, context):
+        """Ask Ollama with context"""
+        prompt = f"""Answer this question based on the research paper context below.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Answer based ONLY on the context provided
+- Be specific and concise
+- If not in context, say "I cannot find that information in the provided sections"
+
+Answer:"""
+        
         try:
-            print("   Calling Ollama API...")
             response = requests.post(
-                f"{self.ollama_url}/api/generate",
+                "http://localhost:11434/api/generate",
                 json={
-                    "model": self.model_name,
+                    "model": self.model,
                     "prompt": prompt,
                     "stream": False
                 },
-                timeout=120
+                timeout=60
             )
-            response.raise_for_status()
-            return response.json()['response']
+            
+            if response.status_code == 200:
+                return response.json()['response']
+            else:
+                return f"API Error: {response.status_code}"
+                
         except requests.exceptions.ConnectionError:
-            raise Exception("❌ Cannot connect to Ollama. Make sure 'ollama serve' is running!")
+            return "❌ Cannot connect to Ollama. Is 'ollama serve' running?"
         except requests.exceptions.Timeout:
-            raise Exception("❌ Request timed out. Try a smaller document or different model.")
+            return "❌ Request timed out. Try a simpler question."
         except Exception as e:
-            raise Exception(f"Ollama API error: {str(e)}")
+            return f"Error: {str(e)}"
     
-    def summarize_paper(self, file_path: str) -> dict:
-        """Main function to summarize a research paper using RAG"""
-        print(f"\n{'='*70}")
-        print(f"📄 Processing: {os.path.basename(file_path)}")
-        print(f"{'='*70}\n")
+    def answer_question(self, question):
+        """Main function to answer a question"""
+        print("\n🔍 Searching relevant sections...")
+        relevant = self.find_relevant_chunks(question, top_k=3)
         
-        # Step 1: Extract text
-        print("📄 Extracting text from PDF...")
-        if file_path.lower().endswith('.pdf'):
-            text = self.extract_text_from_pdf(file_path)
-        else:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                text = f.read()
+        if not relevant:
+            return "❌ Could not find relevant sections for this question."
         
-        print(f"   ✓ Extracted {len(text)} characters\n")
+        print(f"✓ Found {len(relevant)} relevant sections")
+        print("🤖 Generating answer...")
         
-        if len(text) < 100:
-            raise Exception("Not enough text extracted. The PDF might be image-based or corrupted.")
+        # Build context (keep it short)
+        context_parts = []
+        for i, chunk in enumerate(relevant):
+            context_parts.append(f"[Excerpt {i+1}]\n{chunk[:400]}")  # Limit chunk size
         
-        # Step 2: Chunk the document
-        print("✂️  Chunking document...")
-        chunks = self.chunk_text(text)
-        print(f"   ✓ Created {len(chunks)} chunks\n")
+        context = "\n\n".join(context_parts)
         
-        # Step 3: Retrieve relevant chunks (RAG)
-        print("🔍 Retrieving relevant sections (RAG)...")
-        relevant_chunks = self.retrieve_relevant_chunks(chunks, top_k=4)
-        print(f"   ✓ Selected {len(relevant_chunks)} most relevant chunks\n")
+        # Get answer
+        answer = self.ask_ollama(question, context)
+        return answer
+    
+    def chat(self):
+        """Interactive chat loop"""
+        print("\n💬 Ask questions about your PDF! (Type 'quit' to exit)")
+        print("\n📝 Example questions:")
+        print("  • What is the main research question?")
+        print("  • What methodology was used?")
+        print("  • What were the key findings?")
+        print("  • summary (for full summary)")
+        print("="*60)
         
-        # Step 4: Generate summary
-        print("🤖 Generating summary with Ollama (this may take 30-60 seconds)...")
-        
-        # Build context from relevant chunks
-        context = "\n\n".join([f"Section {i+1}:\n{chunk}" for i, chunk in enumerate(relevant_chunks)])
-        
-        prompt = f"""You are an expert at summarizing research papers. Based on the following excerpts from a research paper, provide a comprehensive summary.
-
-Your summary should include:
-1. The main research problem or question
-2. The methodology or approach used
-3. Key findings and results
-4. Main conclusions and contributions
-
-Research paper excerpts:
-{context}
-
-Write a clear, well-structured summary in 3-4 paragraphs. Be specific and focus on the most important information."""
-
-        summary = self.call_ollama(prompt)
-        
-        print("   ✓ Summary complete!\n")
-        
-        return {
-            'file': file_path,
-            'chunks_total': len(chunks),
-            'chunks_used': len(relevant_chunks),
-            'summary': summary,
-            'text_length': len(text)
-        }
-
+        while True:
+            try:
+                question = input("\n❓ Question: ").strip()
+                
+                if not question:
+                    continue
+                
+                if question.lower() in ['quit', 'exit', 'q']:
+                    print("\n👋 Goodbye!")
+                    break
+                
+                # Special command for summary
+                if question.lower() == 'summary':
+                    question = "Provide a summary of this paper: main question, methodology, findings, and conclusions."
+                
+                # Get answer
+                answer = self.answer_question(question)
+                
+                print("\n" + "-"*60)
+                print("💡 Answer:")
+                print("-"*60)
+                print(answer)
+                print("-"*60)
+                
+            except KeyboardInterrupt:
+                print("\n\n👋 Goodbye!")
+                break
+            except Exception as e:
+                print(f"\n❌ Error: {e}")
 
 def main():
-    """Main execution function"""
-    print("\n" + "="*70)
-    print("🎓 AI Research Paper Summarizer with RAG")
-    print("="*70)
+    print("\n🎓 Interactive PDF Q&A with RAG")
+    print("="*60)
     
-    # Parse command line arguments
-    model_name = 'llama3'  # default
-    file_path = None
-    
-    if len(sys.argv) > 2:
-        file_path = sys.argv[1]
-        model_name = sys.argv[2]
-    elif len(sys.argv) > 1:
-        file_path = sys.argv[1]
-    else:
-        print("\nHow to use:")
-        print("  python paper_summarizer.py your_paper.pdf")
-        print("  python paper_summarizer.py your_paper.pdf llama3")
-        print("\nOr enter path below:")
-        file_path = input("\n📁 File path: ").strip()
-        file_path = file_path.strip('"').strip("'")
-    
-    if not file_path:
-        print("❌ No file path provided!")
+    if len(sys.argv) < 2:
+        print("\n📖 Usage:")
+        print("  python pdf_chat.py your_paper.pdf")
+        print("  python pdf_chat.py your_paper.pdf llama3")
+        print("\n⚠️  Make sure 'ollama serve' is running!\n")
         return
     
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        print(f"   Current directory: {os.getcwd()}")
+    pdf_path = sys.argv[1]
+    model = sys.argv[2] if len(sys.argv) > 2 else 'llama3'
+    
+    # Check if file exists
+    import os
+    if not os.path.exists(pdf_path):
+        print(f"\n❌ File not found: {pdf_path}")
         return
     
     try:
-        # Initialize summarizer
-        summarizer = PaperSummarizer(model_name=model_name)
+        # Initialize chatbot
+        print(f"🤖 Using model: {model}")
+        chatbot = PDFChatbot(pdf_path, model)
         
-        # Generate summary
-        result = summarizer.summarize_paper(file_path)
+        # Start interactive chat
+        chatbot.chat()
         
-        # Display results
-        print("="*70)
-        print("📋 SUMMARY")
-        print("="*70 + "\n")
-        print(result['summary'])
-        print("\n" + "="*70)
-        print(f"📊 Statistics:")
-        print(f"   • Document size: {result['text_length']:,} characters")
-        print(f"   • Total chunks: {result['chunks_total']}")
-        print(f"   • Chunks analyzed: {result['chunks_used']}")
-        print("="*70 + "\n")
-        
-        # Save to file
-        save = input("💾 Save summary to file? (y/n): ").strip().lower()
-        if save == 'y':
-            output_file = os.path.splitext(file_path)[0] + "_summary.txt"
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(f"SUMMARY: {os.path.basename(file_path)}\n")
-                f.write("="*70 + "\n\n")
-                f.write(result['summary'])
-                f.write("\n\n" + "="*70 + "\n")
-                f.write(f"Generated by AI Research Paper Summarizer\n")
-            print(f"✅ Summary saved to: {output_file}\n")
-    
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Operation cancelled by user")
+    except MemoryError:
+        print("\n❌ PDF is too large! Try a smaller file.")
     except Exception as e:
-        print(f"\n❌ Error: {str(e)}\n")
+        print(f"\n❌ Error: {e}")
         import traceback
-        print("Debug info:")
         traceback.print_exc()
-
 
 if __name__ == "__main__":
     main()
